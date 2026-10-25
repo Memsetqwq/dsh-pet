@@ -287,9 +287,7 @@ export function toBalanceState(raw: unknown): BalanceState | null {
     }
     // 百分比夹到 0 至 100：越界是数据错误，不代表耗尽或未消耗；非法值则不播档位动画。
     const pct =
-      typeof d.percent === 'number' && Number.isFinite(d.percent)
-        ? Math.max(0, Math.min(100, d.percent))
-        : undefined;
+      typeof d.percent === 'number' && Number.isFinite(d.percent) ? Math.max(0, Math.min(100, d.percent)) : undefined;
     return { provider, shape: 'custom', ok: true, custom: { views, percent: pct } };
   }
   return null;
