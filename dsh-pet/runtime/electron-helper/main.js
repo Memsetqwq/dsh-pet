@@ -22,8 +22,7 @@ try {
   );
   process.exit(3);
 }
-const { app, BrowserWindow, ipcMain, screen, shell, protocol, Tray, Menu, nativeImage, powerMonitor } =
-  electronApi;
+const { app, BrowserWindow, ipcMain, screen, shell, protocol, Tray, Menu, nativeImage, powerMonitor } = electronApi;
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { readFileSync, writeFileSync } = require('node:fs');
@@ -40,6 +39,11 @@ const {
   shouldReassertTopmost,
   topmostLevel,
 } = require('./topmost-watchdog.js');
+const {
+  FULLSCREEN_EXIT_GRACE_MS,
+  createFullscreenWatcher,
+  shouldHidePetForFullscreen,
+} = require('./fullscreen-watchdog.js');
 // 宿主存活判定：宿主退出 → 管道断开 → 自己退，绝不弹框、绝不留僵尸
 const { HOST_POLL_MS, hostIsGone, isBrokenPipeError, parseHostPid } = require('./host-liveness.js');
 // 全局 DPI 线性化的纯判定与换算（平台例外见该文件头）
@@ -263,6 +267,15 @@ const windows = new Map();
 /** win.id -> 上一次请求的内容区矩形（"x,y,w,h"）：pet:set-bounds 的去重基准 */
 const lastRequestedBounds = new Map();
 
+/** 当前前台全屏显示器（已换算成窗口坐标）；null 表示没有全屏 */
+let fullscreenMonitor = null;
+/** 因全屏而被本进程隐藏的窗口 id：只恢复这些窗口，不误 show 其它原因隐藏的窗口 */
+const fullscreenHidden = new Set();
+/** 退出全屏的宽限定时器 */
+let fullscreenExitTimer = null;
+/** 常驻 PowerShell 看门狗 */
+let fullscreenWatcher = null;
+
 /** win.id -> 渲染端上报的窗口余量 `{ l, t }`（DIP）：上边距按气泡最大高度加高后余量不再四边相等，
  *  命中区不能按「窗口宽/4」反推，所以存下来交给 pointer-target 的 spriteHitRect */
 const winMargins = new Map();
@@ -378,6 +391,100 @@ function deskGeometry() {
   return buildDeskGeometry(screen.getAllDisplays(), screen.getPrimaryDisplay().id, process.platform);
 }
 
+// ---------- 全屏应用自动隐藏 ----------
+
+/** 把 PowerShell 返回的物理像素显示器矩形换算成窗口 DIP；DSF=1 时是恒等变换 */
+function fullscreenMonitorToBounds(monitor) {
+  if (!monitor) return null;
+  const rect = {
+    x: Math.round(monitor.x),
+    y: Math.round(monitor.y),
+    width: Math.round(monitor.width),
+    height: Math.round(monitor.height),
+  };
+  if (typeof screen.screenToDipRect === 'function') {
+    try {
+      const dip = screen.screenToDipRect(null, rect);
+      if (dip && [dip.x, dip.y, dip.width, dip.height].every(Number.isFinite)) return dip;
+    } catch {
+      /* 换算失败按恒等处理；Windows 默认强制 DSF=1，本来就不需要换算 */
+    }
+  }
+  return rect;
+}
+
+/** 按当前全屏显示器收起/恢复落在该屏上的宠物；monitor=null 恢复全部 */
+function applyFullscreenVisibility(monitor) {
+  for (const [petId, win] of windows) {
+    if (!win || win.isDestroyed()) continue;
+    const hide = monitor ? shouldHidePetForFullscreen(win.getBounds(), monitor) : false;
+    if (hide) {
+      if (!fullscreenHidden.has(win.id)) {
+        fullscreenHidden.add(win.id);
+        if (win.isVisible()) win.hide();
+        console.error('[dsh-pet-desktop-helper] fullscreen: hide pet ' + petId);
+      }
+    } else if (fullscreenHidden.delete(win.id)) {
+      if (!win.isVisible()) win.showInactive();
+      // 隐藏期间看门狗不会重钉置顶（不可见时钉了没意义），恢复时补一次
+      win.setAlwaysOnTop(true, topmostLevel(process.platform));
+      console.error('[dsh-pet-desktop-helper] fullscreen: show pet ' + petId);
+    }
+  }
+}
+
+/** 看门狗状态 → 隐藏/恢复；进入全屏立即收起，退出全屏给宽限避免闪一下 */
+function setFullscreenMonitor(monitor) {
+  if (monitor) {
+    if (fullscreenExitTimer) {
+      clearTimeout(fullscreenExitTimer);
+      fullscreenExitTimer = null;
+    }
+    fullscreenMonitor = monitor;
+    applyFullscreenVisibility(monitor);
+    return;
+  }
+  if (!fullscreenMonitor || fullscreenExitTimer) return;
+  fullscreenExitTimer = setTimeout(() => {
+    fullscreenExitTimer = null;
+    fullscreenMonitor = null;
+    applyFullscreenVisibility(null);
+  }, FULLSCREEN_EXIT_GRACE_MS);
+  fullscreenExitTimer.unref?.();
+}
+
+/** 看门狗起不来/中途退出：fail-open，立即放回宠物并等下一次重试 */
+function handleFullscreenWatchdogUnavailable() {
+  if (fullscreenExitTimer) {
+    clearTimeout(fullscreenExitTimer);
+    fullscreenExitTimer = null;
+  }
+  fullscreenMonitor = null;
+  applyFullscreenVisibility(null);
+}
+
+/** 启动 Windows 全屏看门狗；冒烟自检/DPI 探测不启动，DSH_PET_FULLSCREEN_HIDE=0 可关闭 */
+function startFullscreenWatchdog() {
+  if (process.platform !== 'win32' || DPI_PROBE || process.env.DSH_PET_SMOKE === '1') return;
+  if (process.env.DSH_PET_FULLSCREEN_HIDE === '0') return;
+  if (windows.size === 0) return;
+  if (fullscreenWatcher) return;
+  fullscreenWatcher = createFullscreenWatcher({
+    onState: (state) => {
+      setFullscreenMonitor(state.fullscreen ? fullscreenMonitorToBounds(state.monitor) : null);
+    },
+    onUnavailable: handleFullscreenWatchdogUnavailable,
+    onLog: (message) => console.error('[dsh-pet-desktop-helper] ' + message),
+  });
+}
+
+/** 停止看门狗；helper 退出时调用，父进程消失时脚本也会自行退出 */
+function stopFullscreenWatchdog() {
+  if (!fullscreenWatcher) return;
+  fullscreenWatcher.stop();
+  fullscreenWatcher = null;
+}
+
 function createPetWindows() {
   const geo = deskGeometry();
   const area = geo.hull;
@@ -434,6 +541,8 @@ function createPetWindows() {
     // 任务栏按钮可能在 show / ready-to-show / 唤醒 / 显示器变化后重建（见 keepOffTaskbar）
     win.on('show', () => keepOffTaskbar(win));
     win.once('ready-to-show', () => {
+      // 全屏守卫可能先于首帧把窗口标记成隐藏：这时不能再 show 出来
+      if (fullscreenHidden.has(win.id)) return;
       keepOffTaskbar(win);
       win.showInactive();
     });
@@ -442,6 +551,7 @@ function createPetWindows() {
     // did-finish-load 里设置，顺序不受影响。
     win.webContents.once('did-finish-load', () => {
       setTimeout(() => {
+        if (fullscreenHidden.has(win.id)) return;
         if (!win.isDestroyed() && !win.isVisible()) win.showInactive();
       }, 400);
     });
@@ -495,6 +605,7 @@ function createPetWindows() {
       inputBusy.delete(win.id);
       inputRegions.delete(win.id);
       offBodyMs.delete(win.id);
+      fullscreenHidden.delete(win.id);
     });
     win
       // 绝对路径：本文件有两条运行方式（宿主 spawn / 同进程 require），相对路径会按 Electron 的
@@ -787,6 +898,8 @@ app.whenReady().then(() => {
 
   linuxPointer?.start();
   createPetWindows();
+  // 全屏游戏/视频自动收起宠物：只启动 Windows 看门狗，状态变化才回传
+  startFullscreenWatchdog();
 
   // 合盖/唤醒是任务栏按钮重建最集中的时刻：resume / unlock-screen 后把每只宠物重新摘一次。
   // powerMonitor 只能在 ready 之后使用，所以挂在这里而不是模块顶层。
@@ -812,6 +925,8 @@ app.whenReady().then(() => {
     if (lastRequestedBounds.get(win.id) !== key) {
       lastRequestedBounds.set(win.id, key);
       win.setContentBounds(rect, false);
+      // 多屏时宠物可能从无全屏的屏走到游戏所在屏，移动后必须重新判定
+      if (fullscreenMonitor) applyFullscreenVisibility(fullscreenMonitor);
     }
     // 窗口余量（左右/上）：命中区判定的依据，余量四边不再相等。
     const ml = Number(bounds?.marginL);
@@ -1210,6 +1325,7 @@ app.whenReady().then(() => {
 // 退出时销毁托盘图标：不销毁会在 Windows 通知区留下「幽灵图标」（鼠标划过才消失）。
 // 宿主改 display 时是 SIGTERM/SIGKILL 硬杀，Windows 上拦不到，所以这条只覆盖优雅退出。
 app.on('before-quit', () => {
+  stopFullscreenWatchdog();
   if (!tray) return;
   try {
     tray.destroy();
